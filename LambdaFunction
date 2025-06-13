@@ -1,0 +1,150 @@
+#Extracts instance data from .csv file stored in a s3 bucket fetches the instance id and reboots the instances
+
+import json
+import urllib3
+import urllib.parse
+from datetime import datetime, timedelta
+import logging
+import os
+from typing import List, Dict, Any
+import boto3
+import csv
+import io
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+def extract_csv_data_from_s3(s3_bucket: str, s3_key: str) -> List[str]:
+    """
+    Download and extract EC2 instance IDs from a CSV file in S3
+    """
+    try:
+        # Initialize S3 client
+        s3_client = boto3.client('s3')
+        
+        # Download the CSV file
+        response = s3_client.get_object(Bucket=s3_bucket, Key=s3_key)
+        csv_content = response['Body'].read().decode('utf-8')
+        
+        # Log CSV content for debugging
+        logger.info(f"CSV Content: {csv_content}")
+        
+        # Parse CSV and extract EC2 instance IDs
+        csv_reader = csv.DictReader(io.StringIO(csv_content))
+        
+        ec2_instance_ids = [row['SERVER_NAME(INSTANCEID)'] for row in csv_reader if 'SERVER_NAME(INSTANCEID)' in row]
+        
+        if not ec2_instance_ids:
+            logger.warning(f"CSV file at s3://{s3_bucket}/{s3_key} did not contain any EC2 instance IDs")
+        
+        return ec2_instance_ids
+        
+    except Exception as e:
+        logger.error(f"Error extracting data from CSV at s3://{s3_bucket}/{s3_key}: {str(e)}")
+        return []
+
+def get_instance_id_by_name(ec2_client, name: str) -> str:
+    response = ec2_client.describe_instances(
+        Filters=[
+            {'Name': 'tag:Name', 'Values': [name]},
+            {'Name': 'instance-state-name', 'Values': ['running', 'stopped', 'pending', 'stopping']}
+        ]
+    )
+    instances = [
+        instance['InstanceId']
+        for reservation in response['Reservations']
+        for instance in reservation['Instances']
+    ]
+    return instances[0] if instances else None
+
+def reboot_ec2_instances_by_name(instance_names: List[str], region: str = 'eu-west-1') -> bool:
+    ec2_client = boto3.client('ec2', region_name=region)
+    instance_ids = []
+
+    for name in instance_names:
+        instance_id = get_instance_id_by_name(ec2_client, name)
+        if instance_id:
+            instance_ids.append(instance_id)
+        else:
+            logger.warning(f"No instance ID found for name: {name}")
+
+    if not instance_ids:
+        logger.error("No valid instance IDs found to reboot.")
+        return False
+
+    try:
+        ec2_client.reboot_instances(InstanceIds=instance_ids)
+        logger.info(f"Rebooted instances: {instance_ids}")
+        return True
+    except Exception as e:
+        logger.error(f"Error rebooting EC2 instances: {str(e)}", exc_info=True)
+        return False
+
+def lambda_handler(event, context):
+    """
+    Main Lambda function handler to process CSV from S3 and reboot EC2 instances
+    """
+    # Hardcoded S3 bucket and file path
+    S3_BUCKET_NAME = 'a205257-big-fix-handler-bucket'
+    S3_FILE_KEY = 'INC7286253.csv'
+    
+    try:
+        # Extract EC2 instance IDs from the CSV file in S3
+        instance_ids = extract_csv_data_from_s3(S3_BUCKET_NAME, S3_FILE_KEY)
+        
+        if not instance_ids:
+            logger.info("No EC2 instances found in the CSV file to reboot")
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'message': 'No EC2 instances found in the CSV file',
+                    'instance_count': 0
+                })
+            }
+        
+        # Reboot EC2 instances
+        reboot_success = reboot_ec2_instances_by_name(instance_ids, region='eu-west-1')
+        
+        if reboot_success:
+            logger.info(f"Successfully rebooted {len(instance_ids)} EC2 instances")
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'message': 'Successfully rebooted EC2 instances',
+                    'instance_count': len(instance_ids)
+                })
+            }
+        else:
+            logger.error("Failed to reboot EC2 instances")
+            return {
+                'statusCode': 500,
+                'body': json.dumps({
+                    'error': 'Failed to reboot EC2 instances'
+                })
+            }
+        
+    except Exception as e:
+        logger.error(f"Error in lambda_handler: {str(e)}", exc_info=True)
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'error': 'Internal server error',
+                'message': str(e)
+            })
+        }
+
+# For local testing
+if __name__ == "__main__":
+    # Test configuration
+    test_event = {}
+    test_context = type('Context', (), {
+        'function_name': 'test-function',
+        'memory_limit_in_mb': 128,
+        'invoked_function_arn': 'arn:aws:lambda:us-east-1:123456789012:function:test',
+        'aws_request_id': 'test-request-id'
+    })()
+    
+    # Run test
+    result = lambda_handler(test_event, test_context)
+    print(json.dumps(result, indent=2))
